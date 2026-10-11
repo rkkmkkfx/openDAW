@@ -21,7 +21,9 @@ use engine_env::processor::Processor;
 use transport::transport::RENDER_QUANTUM;
 use crate::param_automation::{ParamHandle, ParamSink};
 use crate::audio_unit::SidechainSink;
-use crate::{call_device_process, call_device_reset, DeviceReg, PullLink, DEVICE_MAX_EVENTS, INPUTS, PULL};
+#[cfg(not(feature = "native"))]
+use crate::{call_device_process, call_device_reset};
+use crate::{DeviceReg, PullLink, DEVICE_MAX_EVENTS, INPUTS, PULL};
 
 /// A graph node that voices its notes through a loaded instrument device (e.g. `device_sine.wasm`). It
 /// pulls notes from its `PullLink` chain (resolved by the device via `host_pull_events`), fills the
@@ -30,7 +32,11 @@ use crate::{call_device_process, call_device_reset, DeviceReg, PullLink, DEVICE_
 /// node copies to its output for the master bus. All device-facing memory (state, IO, descriptor)
 /// is talc-allocated here, so it is freed when the instrument is dropped.
 pub(crate) struct PluginInstrument {
+    #[cfg(feature = "native")]
+    native_state: device_vaporisateur::VaporisateurState,
+    #[cfg_attr(feature = "native", allow(dead_code))]
     process_index: u32, // the device's `process` slot in the shared function table
+    #[cfg_attr(feature = "native", allow(dead_code))]
     reset_index: u32,   // the device's `reset` slot (clears voices on STOP); 0 if none
     sample_rate: f32,
     // A disabled instrument is SILENCED at the source (mirrors TS instrument processors, e.g. Nano:
@@ -82,22 +88,24 @@ impl PluginInstrument {
         let state_size = device.state_size as usize;
         let device_state = vec![0u32; state_size.div_ceil(4)].into_boxed_slice(); // 4-aligned, >= state_size bytes
         // Two output offsets (L, R) -> the two device output buffers; the engine is stereo.
-        let out_offsets = vec![device_output[0].as_ptr() as u32, device_output[1].as_ptr() as u32].into_boxed_slice();
+        let out_offsets = vec![crate::device_address(device_output[0].as_ptr()), crate::device_address(device_output[1].as_ptr())].into_boxed_slice();
         // descriptor words (see the `abi` layout): frames, in_count/ptr, out_count/ptr (2, stereo),
         // param_count/ptr, state_ptr, in_event_cap/ptr (pull scratch), out_event_cap/ptr (0, instrument has no
         // event out), block_count/ptr (set per quantum from the ProcessInfo), sample_rate (f32 bits).
         let descriptor = vec![
             RENDER_QUANTUM as u32,
             0, 0,
-            2, out_offsets.as_ptr() as u32,
+            2, crate::device_address(out_offsets.as_ptr()),
             0, 0,
-            device_state.as_ptr() as u32,
-            DEVICE_MAX_EVENTS as u32, device_events.as_ptr() as u32,
+            crate::device_address(device_state.as_ptr()),
+            DEVICE_MAX_EVENTS as u32, crate::device_address(device_events.as_ptr()),
             0, 0,
             0, 0,
             sample_rate.to_bits()
         ].into_boxed_slice();
         Self {
+            #[cfg(feature = "native")]
+            native_state: device_vaporisateur::VaporisateurState::new_native(sample_rate),
             process_index: device.process_index,
             reset_index: device.reset_index,
             sample_rate,
@@ -150,7 +158,7 @@ impl ParamSink for PluginInstrument {
     }
 
     fn state_ptr(&self) -> u32 {
-        self.device_state.as_ptr() as u32
+        crate::device_address(self.device_state.as_ptr())
     }
 }
 
@@ -160,7 +168,7 @@ impl SidechainSink for PluginInstrument {
         self.sidechain_buffers.clear();
         for (port_id, source) in sources {
             let buffer = source.borrow();
-            let (left, right) = (buffer.left.as_ptr() as u32, buffer.right.as_ptr() as u32);
+            let (left, right) = (crate::device_address(buffer.left.as_ptr()), crate::device_address(buffer.right.as_ptr()));
             drop(buffer);
             self.input_ports.push((*port_id, left, right));
             self.sidechain_buffers.push(source.clone());
@@ -184,7 +192,10 @@ impl Processor for PluginInstrument {
     fn reset(&mut self) {
         // Transport STOP: drop every active voice (the device clears its voice pool / envelopes), and clear the
         // buffered events.
-        call_device_reset(self.reset_index, self.device_state.as_ptr() as u32);
+        #[cfg(not(feature = "native"))]
+        call_device_reset(self.reset_index, crate::device_address(self.device_state.as_ptr()));
+        #[cfg(feature = "native")]
+        { self.native_state.reset_native(); }
         self.events.clear();
         self.meter.clear();
     }
@@ -202,7 +213,7 @@ impl Processor for PluginInstrument {
         // shared memory) — no per-node copy. The blocks Vec may move between quanta, so refresh the pointer.
         self.descriptor[0] = RENDER_QUANTUM as u32;
         self.descriptor[12] = info.blocks.len() as u32;
-        self.descriptor[13] = info.blocks.as_ptr() as u32;
+        self.descriptor[13] = crate::device_address(info.blocks.as_ptr());
         // Hand the device its pull context, then call it. The device PULLS its events via host_pull_events.
         // Scope the `PULL.get()` borrow so none is live across `call_device_process` (the device's
         // host_pull_events takes its own `PULL.get()`); single-threaded, so the two never overlap.
@@ -217,7 +228,46 @@ impl Processor for PluginInstrument {
             core::mem::swap(&mut self.params, &mut pull.params); // move our params in (no alloc)
             core::mem::swap(&mut self.input_ports, unsafe { INPUTS.get() });
         }
-        call_device_process(self.process_index, self.descriptor.as_ptr() as u32);
+        #[cfg(not(feature = "native"))]
+        call_device_process(self.process_index, crate::device_address(self.descriptor.as_ptr()));
+        #[cfg(feature = "native")]
+        if self.process_index == u32::MAX {
+            use abi::Instrument;
+            let [left, right] = &mut self.device_output;
+            self.native_state.set_base_frequency(unsafe { *crate::BASE_FREQUENCY.get() });
+            left.fill(0.0);
+            right.fill(0.0);
+            for block in info.blocks {
+                let mut count = crate::pull_events_into(block.p0, block.p1, block.flags.0,
+                    &mut self.device_events, 0) as usize;
+                let apply = |state: &mut device_vaporisateur::VaporisateurState, position: f64| {
+                    let pull = unsafe { PULL.get() };
+                    for handle in &pull.params {
+                        let (value, kind, modulation) = handle.resolve_held(position, block.flags.transporting());
+                        state.apply_parameter(handle.id, abi::ParamValue::from_wire(kind, value, modulation));
+                    }
+                };
+                apply(&mut self.native_state, block.p0);
+                let mut position = crate::host_first_update_position(block.p0);
+                while position < block.p1 && count < self.device_events.len() {
+                    self.device_events[count] = EventRecord { position, offset: 0,
+                        kind: abi::EVENT_PARAM, id: 0, pitch: 0, velocity: 0.0, cent: 0.0, duration: 0.0 };
+                    count += 1;
+                    position = crate::host_next_update_position(position);
+                }
+                for event in &mut self.device_events[..count] {
+                    event.offset = crate::sample_offset(event.position, block, self.sample_rate) as u32;
+                }
+                self.device_events[..count].sort_unstable_by(|a,b| {
+                    let rank = |kind| match kind { abi::EVENT_NOTE_OFF | abi::EVENT_CHOKE => 0,
+                        abi::EVENT_PARAM => 1, _ => 2 };
+                    a.offset.cmp(&b.offset).then_with(|| rank(a.kind).cmp(&rank(b.kind)))
+                });
+                abi::dispatch_range_with_parameters::<device_vaporisateur::Vaporisateur>(&mut self.native_state,
+                    [left, right], &self.device_events[..count], block, apply);
+            }
+            device_vaporisateur::Vaporisateur::finish(&mut self.native_state, [left, right]);
+        }
         {
             let pull = unsafe { PULL.get() };
             pull.current = None;

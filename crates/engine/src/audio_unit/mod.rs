@@ -65,7 +65,8 @@ use crate::audio_region_player::AudioRegionPlayer;
 use crate::midi_output::{self, CcBinding, MidiOutControls, MidiOutProcessor};
 use crate::time_stretch::{TimeStretchConfig, TransientPlayMode};
 use crate::tempo_map::{SharedTempoMap, TempoMap};
-use crate::{call_device_init, call_device_field_changed, call_device_parameter_changed, call_device_sample_changed, call_device_soundfont_changed, call_device_terminate, CompositeSpec, DeviceReg, Engine, FieldObs, PullLink, BIND, BROADCAST_BINDS, DEVICE_BROADCASTS, DEVICE_BROADCAST_FREE, FIELD_OBS, SAMPLE_OBS, SAMPLES, SOUNDFONT_OBS, SOUNDFONTS, SIDECHAIN_BIND, CURRENT_DEVICE_UUID, EFFECT_INDEX_KEY};
+use crate::call_device_init;
+use crate::{call_device_field_changed, call_device_parameter_changed, call_device_sample_changed, call_device_soundfont_changed, call_device_terminate, CompositeSpec, DeviceReg, Engine, FieldObs, PullLink, BIND, BROADCAST_BINDS, DEVICE_BROADCASTS, DEVICE_BROADCAST_FREE, FIELD_OBS, SAMPLE_OBS, SAMPLES, SOUNDFONT_OBS, SOUNDFONTS, SIDECHAIN_BIND, CURRENT_DEVICE_UUID, EFFECT_INDEX_KEY};
 
 mod wiring;
 mod routing;

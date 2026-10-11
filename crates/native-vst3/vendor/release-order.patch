@@ -1,0 +1,39 @@
+--- a/src/internal/plugin_impl.rs
++++ b/src/internal/plugin_impl.rs
+@@ -140,9 +140,7 @@
+ /// Internal plugin implementation that handles all VST3 COM interactions
+ pub struct PluginImpl {
+     // Core VST3 interfaces
+-    component: ComPtr<IComponent>,
+     processor: ComPtr<IAudioProcessor>,
+-    controller: Option<ComPtr<IEditController>>,
+     /// True when the component and controller are the same object (single-component
+     /// plugin). Then `IComponent::setState` already restores the controller, and calling
+     /// `setComponentState` on top of it would double-apply and corrupt parameters.
+@@ -256,6 +254,12 @@
+     // timers), serviced on the host UI thread via `service_run_loop`.
+     #[cfg(target_os = "linux")]
+     run_loop: Arc<Mutex<RunLoopRegistry>>,
++
++    // Rust drops fields in declaration order after Drop::drop. Release processor, view and
++    // connection-point references before their owning controller/component; DPF plugins keep
++    // these as independent child interfaces and otherwise defer parent deletion until unload.
++    controller: Option<ComPtr<IEditController>>,
++    component: ComPtr<IComponent>,
+ 
+     // VST3 module handle (kept alive). Declared after every plugin-side COM reference above so
+     // those are released while the module's vtables still exist, and before `_host_app` below.
+@@ -4797,10 +4801,11 @@
+ /// It holds its own references (COM refcounts), so `load` keeps using the originals as it
+ /// builds; the extra references are released when the guard drops either way.
+ struct InitializedComponent {
++    // Rollback releases child connection interfaces before either owning parent.
++    connection: Option<ConnectionPair>,
++    controller: Option<ComPtr<IEditController>>,
+     component: ComPtr<IComponent>,
+-    controller: Option<ComPtr<IEditController>>,
+     single_component: bool,
+-    connection: Option<ConnectionPair>,
+     armed: bool,
+ }
+ 

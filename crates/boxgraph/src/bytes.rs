@@ -106,7 +106,7 @@ impl<'a> ByteReader<'a> {
     }
 
     fn take(&mut self, count: usize) -> Result<&'a [u8], ByteError> {
-        if self.position + count > self.bytes.len() {
+        if count > self.remaining() {
             return Err(ByteError::UnexpectedEnd);
         }
         let slice = &self.bytes[self.position..self.position + count];
@@ -136,6 +136,14 @@ impl<'a> ByteReader<'a> {
         Ok(i32::from_be_bytes(self.take_array()?))
     }
 
+    pub fn read_count(&mut self, minimum_bytes: usize) -> Result<usize, ByteError> {
+        let count = usize::try_from(self.read_int()?).map_err(|_| ByteError::UnexpectedEnd)?;
+        if count > self.remaining() / minimum_bytes.max(1) {
+            return Err(ByteError::UnexpectedEnd);
+        }
+        Ok(count)
+    }
+
     pub fn read_long(&mut self) -> Result<i64, ByteError> {
         Ok(i64::from_be_bytes(self.take_array()?))
     }
@@ -158,7 +166,7 @@ impl<'a> ByteReader<'a> {
     }
 
     pub fn read_utf16(&mut self) -> Result<Vec<u16>, ByteError> {
-        let count = self.read_int()? as usize;
+        let count = self.read_count(2)?;
         let mut units = Vec::with_capacity(count);
         for _ in 0..count {
             units.push(self.read_short()? as u16)
