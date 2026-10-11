@@ -1,0 +1,11 @@
+[package]
+name = "native-vst3"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[dependencies]
+vst3-host = { version = "=0.10.0", default-features = false }
+

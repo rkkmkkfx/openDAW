@@ -9,11 +9,16 @@ use std::io::{self, Write};
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const MAX_FRAMES: u32 = (u32::MAX - 36) / 4;
 
-pub fn render_wav(mut writer: impl Write, frames: u32) -> io::Result<()> {
-    if frames > MAX_FRAMES {
+pub fn write_wav(
+    mut writer: impl Write,
+    sample_rate: u32,
+    frames: u32,
+    mut render: impl FnMut(&mut engine_env::audio_buffer::AudioBuffer) -> io::Result<()>,
+) -> io::Result<()> {
+    if frames > MAX_FRAMES || sample_rate == 0 || sample_rate > u32::MAX / 4 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "frame count exceeds RIFF capacity",
+            "invalid sample rate or frame count exceeds RIFF capacity",
         ));
     }
     let data_size = frames * 4;
@@ -23,33 +28,26 @@ pub fn render_wav(mut writer: impl Write, frames: u32) -> io::Result<()> {
     writer.write_all(&16_u32.to_le_bytes())?;
     writer.write_all(&1_u16.to_le_bytes())?;
     writer.write_all(&2_u16.to_le_bytes())?;
-    writer.write_all(&SAMPLE_RATE.to_le_bytes())?;
-    writer.write_all(&(SAMPLE_RATE * 4).to_le_bytes())?;
+    writer.write_all(&sample_rate.to_le_bytes())?;
+    writer.write_all(&(sample_rate * 4).to_le_bytes())?;
     writer.write_all(&4_u16.to_le_bytes())?;
     writer.write_all(&16_u16.to_le_bytes())?;
     writer.write_all(b"data")?;
     writer.write_all(&data_size.to_le_bytes())?;
-    let source = shared_audio_buffer();
-    let output = shared_audio_buffer();
-    let mut bus = AudioBusProcessor::new(output.clone());
-    bus.add_audio_source(source.clone());
-    let mut oscillator = BandLimitedOscillator::new(SAMPLE_RATE as f32);
+    let mut buffer = engine_env::audio_buffer::AudioBuffer::new();
     let mut pcm = [0_u8; RENDER_QUANTUM * 4];
     let mut remaining = frames;
     while remaining > 0 {
         let count = remaining.min(RENDER_QUANTUM as u32) as usize;
-        {
-            let mut buffer = source.borrow_mut();
-            buffer.clear();
-            oscillator.generate(&mut buffer.left, 1_000.0, ClassicWaveform::Sine, 0, count);
-            for index in 0..count {
-                buffer.left[index] *= 0.2;
-                buffer.right[index] = buffer.left[index];
-            }
-        }
-        bus.process(&ProcessInfo { blocks: &[] });
-        let buffer = output.borrow();
+        buffer.clear();
+        render(&mut buffer)?;
         for index in 0..count {
+            if !buffer.left[index].is_finite() || !buffer.right[index].is_finite() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "nonfinite audio from renderer",
+                ));
+            }
             let offset = index * 4;
             let left = (buffer.left[index].clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
             let right = (buffer.right[index].clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
@@ -60,4 +58,33 @@ pub fn render_wav(mut writer: impl Write, frames: u32) -> io::Result<()> {
         remaining -= count as u32;
     }
     Ok(())
+}
+
+pub fn render_wav(writer: impl Write, frames: u32) -> io::Result<()> {
+    let source = shared_audio_buffer();
+    let output = shared_audio_buffer();
+    let mut bus = AudioBusProcessor::new(output.clone());
+    bus.add_audio_source(source.clone());
+    let mut oscillator = BandLimitedOscillator::new(SAMPLE_RATE as f32);
+    write_wav(writer, SAMPLE_RATE, frames, |buffer| {
+        {
+            let mut source_buffer = source.borrow_mut();
+            oscillator.generate(
+                &mut source_buffer.left,
+                1_000.0,
+                ClassicWaveform::Sine,
+                0,
+                RENDER_QUANTUM,
+            );
+            for index in 0..RENDER_QUANTUM {
+                source_buffer.left[index] *= 0.2;
+                source_buffer.right[index] = source_buffer.left[index];
+            }
+        }
+        bus.process(&ProcessInfo { blocks: &[] });
+        let output = output.borrow();
+        buffer.left.copy_from_slice(&output.left);
+        buffer.right.copy_from_slice(&output.right);
+        Ok(())
+    })
 }
