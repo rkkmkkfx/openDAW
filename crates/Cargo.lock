@@ -536,6 +536,7 @@ dependencies = [
  "abi",
  "bindings",
  "boxgraph",
+ "device-vaporisateur",
  "dsp",
  "engine-env",
  "math",

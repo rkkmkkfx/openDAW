@@ -87,6 +87,24 @@ pub struct VaporisateurParams {
     pub(crate) workspace: RefCell<Workspace>
 }
 
+#[cfg(not(target_family = "wasm"))]
+impl VaporisateurParams {
+    pub(crate) fn native_defaults(sample_rate: f32) -> Self {
+        Self {
+            gain_osc_a: 0.5, gain_osc_b: 0.0,
+            osc_a_waveform: ClassicWaveform::Saw, osc_b_waveform: ClassicWaveform::Saw,
+            osc_a_octave: 0, osc_a_tune: 0.0, osc_b_octave: 0, osc_b_tune: 0.0,
+            frequency_a_multiplier: 1.0, frequency_b_multiplier: 1.0,
+            env_attack: 0.001, env_decay: 0.001, env_sustain: 1.0, env_release: 0.05,
+            flt_cutoff: 1.0, flt_resonance: 0.7, flt_env_amount: 0.0, flt_order: 1,
+            filter_keyboard: 0.0, lfo_shape: ClassicWaveform::Sine, lfo_rate: 0.0001,
+            lfo_target_tune: 0.0, lfo_target_cutoff: 0.0, lfo_target_volume: 0.0,
+            unison_detune: 30.0, unison_stereo: 1.0, sample_rate,
+            workspace: RefCell::new(Workspace::default()),
+        }
+    }
+}
+
 /// One Vaporisateur voice. All per-note DSP is reconstructed in `start` (fresh phase / envelope / glide, like
 /// the TS `new VaporisateurVoice` per note); `process` renders the osc -> mix -> filter -> ADSR-VCA chain.
 pub struct VaporisateurVoice {
@@ -172,6 +190,7 @@ impl VaporisateurVoice {
 
 impl VaporisateurVoice {
     /// The amp envelope's UI phase (TS `first.env.phase`), for the editor's envelope playhead broadcast.
+    #[cfg(target_family = "wasm")]
     pub fn env_phase(&self) -> f32 {
         self.env.phase() as f32
     }

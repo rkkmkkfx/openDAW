@@ -43,7 +43,9 @@ const MONO_STACK: usize = 16; // monophonic held-note stack depth
 const UNISON_MAX: usize = 5; // the widest unison (the unison-count values are [1, 3, 5])
 // The editor's envelope playheads at address.append(0) (TS `envValues`): one `env.phase` per sounding
 // voice group (32 max, -1 closes the stream), written only while the UI subscribes.
+#[cfg(target_family = "wasm")]
 const ENV_FIELD: [u16; 1] = [0];
+#[cfg(target_family = "wasm")]
 const ENV_VALUES: usize = 32;
 
 // This device's value mappings (uniform 0..1 -> the parameter's real value), mirroring the TS adapter.
@@ -114,8 +116,83 @@ pub struct VaporisateurState {
     glide_time: f64,
     unison_count: i32,
     ids: [u32; param::COUNT],
+    #[cfg(target_family = "wasm")]
     env_id: u32,
-    env_ptr: u32
+    #[cfg(target_family = "wasm")]
+    env_ptr: u32,
+    #[cfg(not(target_family = "wasm"))]
+    base_frequency: f32
+}
+
+/// Stable native parameter IDs paired with the production BoxGraph field paths.
+#[cfg(not(target_family = "wasm"))]
+pub fn parameter_paths() -> &'static [(u32, &'static [u16])] {
+    &[
+        (0, &[40, 0, 1]),
+        (1, &[40, 0, 2]),
+        (2, &[40, 0, 3]),
+        (3, &[40, 0, 4]),
+        (4, &[40, 1, 1]),
+        (5, &[40, 1, 2]),
+        (6, &[40, 1, 3]),
+        (7, &[40, 1, 4]),
+        (8, &[16]),
+        (9, &[19]),
+        (10, &[20]),
+        (11, &[17]),
+        (12, &[14]),
+        (13, &[15]),
+        (14, &[18]),
+        (15, &[26]),
+        (16, &[27]),
+        (17, &[21]),
+        (18, &[22]),
+        (19, &[23]),
+        (20, &[24]),
+        (21, &[25]),
+        (22, &[30, 1]),
+        (23, &[30, 2]),
+        (24, &[30, 10]),
+        (25, &[30, 11]),
+        (26, &[30, 12]),
+    ]
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl VaporisateurState {
+    /// Construct valid owned DSP storage, with an audible initial patch and no host callbacks.
+    /// Projects should apply their saved parameter values before starting playback.
+    pub fn new_native(sample_rate: f32) -> Self {
+        assert!(sample_rate.is_finite() && sample_rate > 0.0);
+        let mut state = Self {
+            voicing: Voicing::new(),
+            params: VaporisateurParams::native_defaults(sample_rate),
+            limiter: dsp::simple_limiter::SimpleLimiter::new(sample_rate),
+            sample_rate, glide_time: 0.0, unison_count: 1,
+            ids: core::array::from_fn(|index| index as u32),
+            base_frequency: 440.0,
+        };
+        state.voicing.set_mode(VoicingMode::Polyphonic);
+        state
+    }
+
+    /// Apply a resolved real or normalized automation value. Unknown IDs are rejected.
+    pub fn apply_parameter(&mut self, id: u32, value: ParamValue) -> bool {
+        if !self.ids.contains(&id) { return false; }
+        Vaporisateur::parameter_changed(self, id, value);
+        true
+    }
+
+    /// Set the A4 reference for this instance; existing voices retain their starting tuning.
+    pub fn set_base_frequency(&mut self, frequency: f32) {
+        assert!(frequency.is_finite() && frequency > 0.0);
+        self.base_frequency = frequency;
+    }
+
+    /// Stop voices with the same reset semantics as the WASM device.
+    pub fn reset_native(&mut self) {
+        Vaporisateur::reset(self);
+    }
 }
 
 /// The DSP, plugged into the SDK's `Instrument` template ([`abi::render_instrument`]).
@@ -128,6 +205,8 @@ impl Instrument for Vaporisateur {
         state.sample_rate = sample_rate; // stable for the device's life
         state.params.sample_rate = sample_rate;
         state.limiter.prepare(sample_rate);
+        #[cfg(target_family = "wasm")]
+        {
         state.ids[param::OSC_A_WAVEFORM] = abi::bind_parameter(&[40, 0, 1]);
         state.ids[param::OSC_A_VOLUME] = abi::bind_parameter(&[40, 0, 2]);
         state.ids[param::OSC_A_OCTAVE] = abi::bind_parameter(&[40, 0, 3]);
@@ -157,13 +236,20 @@ impl Instrument for Vaporisateur {
         state.ids[param::LFO_TARGET_VOLUME] = abi::bind_parameter(&[30, 12]);
         state.env_id = abi::bind_broadcast(&ENV_FIELD, ENV_VALUES as u32);
         state.env_ptr = 0;
+        }
+        #[cfg(not(target_family = "wasm"))]
+        { state.ids = core::array::from_fn(|index| index as u32); }
     }
 
     fn handle_event(state: &mut VaporisateurState, event: &EventRecord) {
         if event.kind == EVENT_NOTE_ON {
             // TS `computeFrequency`: `midiToHz(pitch + cent/100, context.baseFrequency)`, the tuning
             // reference pulled from the host per note-on (a running voice never retunes).
-            let frequency = midi_to_hz_base(event.pitch as f32 + event.cent / 100.0, abi::base_frequency());
+            #[cfg(target_family = "wasm")]
+            let base_frequency = abi::base_frequency();
+            #[cfg(not(target_family = "wasm"))]
+            let base_frequency = state.base_frequency;
+            let frequency = midi_to_hz_base(event.pitch as f32 + event.cent / 100.0, base_frequency);
             let glide_time = state.glide_time;
             let unison = state.unison_count.max(1) as usize;
             state.voicing.start(event, frequency, 1.0, glide_time, unison, &state.params);
@@ -176,6 +262,7 @@ impl Instrument for Vaporisateur {
         let [out_left, out_right] = output;
         state.voicing.process([&mut *out_left, &mut *out_right], block, &state.params);
         state.limiter.replace(out_left, out_right, 0, out_left.len());
+        #[cfg(target_family = "wasm")]
         if abi::broadcast_active(state.env_id) {
             if state.env_ptr == 0 {
                 state.env_ptr = abi::broadcast_ptr(state.env_id);
@@ -270,19 +357,19 @@ pub fn render(state: &mut VaporisateurState, events: &[EventRecord], out_left: &
 // ---- The device ABI: shared with the engine, called wasm-to-wasm. ----
 
 /// What the host wires this device as (read at load): an instrument that voices notes into audio.
-#[no_mangle]
+#[cfg_attr(target_family = "wasm", no_mangle)]
 pub extern "C" fn kind() -> u32 {
     abi::DEVICE_KIND_INSTRUMENT
 }
 
 /// Bytes the engine must allocate (zeroed) for one instance's state block. The voice pools are fixed, so the
 /// size does not depend on `sample_rate`.
-#[no_mangle]
+#[cfg_attr(target_family = "wasm", no_mangle)]
 pub extern "C" fn state_size(_sample_rate: f32) -> u32 {
     core::mem::size_of::<VaporisateurState>() as u32
 }
 
-#[no_mangle]
+#[cfg_attr(target_family = "wasm", no_mangle)]
 pub extern "C" fn process(desc_ptr: u32) {
     let ports = unsafe { Ports::<VaporisateurState>::from_descriptor(desc_ptr) };
     abi::render_instrument::<Vaporisateur>(ports);
@@ -290,20 +377,20 @@ pub extern "C" fn process(desc_ptr: u32) {
 
 /// Boot hook: bind this device's parameters with the host (it records their field-paths and returns an id
 /// each) and stash the (stable) sample rate.
-#[no_mangle]
+#[cfg_attr(target_family = "wasm", no_mangle)]
 pub extern "C" fn init(state_ptr: u32, sample_rate: f32) {
     unsafe { abi::with_state(state_ptr, |state| <Vaporisateur as Instrument>::init(state, sample_rate)) }
 }
 
 /// Apply a parameter value the host resolved (initial / edit / automation), by the id `init` got back. The
 /// `kind` tag tells the SDK how to type the f32 `value` into a `ParamValue`.
-#[no_mangle]
+#[cfg_attr(target_family = "wasm", no_mangle)]
 pub extern "C" fn parameter_changed(state_ptr: u32, id: u32, kind: u32, value: f32, modulation: f32) {
     unsafe { abi::with_state(state_ptr, |state| <Vaporisateur as Instrument>::parameter_changed(state, id, ParamValue::from_wire(kind, value, modulation))) }
 }
 
 /// Parity probe: the REAL value stored for a UNIT automation value, ids in `init` bind order (the `param` slots).
-#[no_mangle]
+#[cfg_attr(target_family = "wasm", no_mangle)]
 pub extern "C" fn map_parameter(id: u32, unit: f32) -> f32 {
     let value = ParamValue::Unit(unit);
     match id as usize {
@@ -328,7 +415,7 @@ pub extern "C" fn map_parameter(id: u32, unit: f32) -> f32 {
 }
 
 /// Transport STOP: drop every voice (force-stop the voicing) so playback starts silent.
-#[no_mangle]
+#[cfg_attr(target_family = "wasm", no_mangle)]
 pub extern "C" fn reset(state_ptr: u32) {
     unsafe { abi::with_state(state_ptr, |state| <Vaporisateur as Instrument>::reset(state)) }
 }
@@ -342,11 +429,31 @@ mod tests {
 
     const SR: f32 = 48_000.0;
 
+    #[test]
+    fn native_constructor_and_parameter_bindings_render_and_reset() {
+        let mut state = VaporisateurState::new_native(SR);
+        let paths = parameter_paths();
+        assert_eq!(paths.len(), 27);
+        let volume = paths.iter().find(|(_, path)| *path == [40, 0, 2]).unwrap().0;
+        let (mut left, mut right) = (vec![0.0; 4096], vec![0.0; 4096]);
+        render(&mut state, &[note_on(1, 69)], &mut left, &mut right, SR);
+        assert!(peak(&left) > 0.001);
+        assert!(left.iter().all(|sample| sample.is_finite()));
+        state.reset_native();
+        render(&mut state, &[], &mut left, &mut right, SR);
+        assert_eq!(peak(&left), 0.0);
+        assert!(state.apply_parameter(volume, ParamValue::Float(f32::NEG_INFINITY)));
+        assert!(!state.apply_parameter(999, ParamValue::Float(1.0)));
+        render(&mut state, &[note_on(2, 69)], &mut left, &mut right, SR);
+        assert_eq!(peak(&left), 0.0);
+    }
+
+
     /// A zeroed state configured for a clearly audible patch: oscillator A a saw at unity, B silent, the
     /// filter wide open, a fast envelope, polyphonic, one unison voice. (The engine pushes the real defaults
     /// via `parameter_changed`; the tests set the fields the DSP reads directly.)
     fn configured(mode: VoicingMode) -> VaporisateurState {
-        let mut state: VaporisateurState = unsafe { core::mem::zeroed() };
+        let mut state = VaporisateurState::new_native(SR);
         state.sample_rate = SR;
         state.params.sample_rate = SR;
         state.limiter.prepare(SR);
@@ -401,17 +508,16 @@ mod tests {
 
     #[test]
     fn the_host_tuning_reference_shifts_the_voice_pitch() {
-        let render_a4 = || {
+        let render_a4 = |tuning| {
             let mut state = configured(VoicingMode::Polyphonic);
+            state.set_base_frequency(tuning);
             state.params.osc_a_waveform = ClassicWaveform::Sine; // clean crossings for the estimate
             let (mut left, mut right) = (vec![0.0f32; 48_000], vec![0.0f32; 48_000]);
             render(&mut state, &[note_on(1, 69)], &mut left, &mut right, SR);
             estimate_frequency(&left[4_800..], SR) // skip the attack
         };
-        let reference = render_a4();
-        abi::set_native_base_frequency(432.0);
-        let detuned = render_a4();
-        abi::set_native_base_frequency(440.0); // restore the default for the other tests
+        let reference = render_a4(440.0);
+        let detuned = render_a4(432.0);
         assert!((reference - 440.0).abs() < 2.0, "A4 at the default tuning, got {reference}");
         assert!((detuned - 432.0).abs() < 2.0, "A4 at a 432 reference, got {detuned}");
         assert!((detuned / reference - 432.0 / 440.0).abs() < 0.005,

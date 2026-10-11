@@ -1416,6 +1416,14 @@ pub fn chunk_start() -> usize {
 /// unit-testable without the engine. Does not clear `output` or run `finish`.
 #[inline]
 pub fn dispatch_range<I: Instrument>(state: &mut I::State, output: [&mut [f32]; 2], events: &[EventRecord], block: &Block) {
+    dispatch_range_with_parameters::<I>(state, output, events, block,
+        |state, position| apply_param_changes::<I::State>(state, position, I::parameter_changed));
+}
+
+/// Safe native dispatch seam: parameter updates belong to the caller's owned
+/// device state and host context, rather than a shared-memory callback.
+pub fn dispatch_range_with_parameters<I: Instrument>(state: &mut I::State, output: [&mut [f32]; 2],
+    events: &[EventRecord], block: &Block, mut update_parameters: impl FnMut(&mut I::State, f64)) {
     let [out_left, out_right] = output;
     let frames = out_left.len();
     let s0 = (block.s0 as usize).min(frames);
@@ -1435,7 +1443,7 @@ pub fn dispatch_range<I: Instrument>(state: &mut I::State, output: [&mut [f32]; 
         }
         // A clock event (Route D) pulls the parameters changed at this position; a note event voices.
         if event.kind == EVENT_PARAM {
-            apply_param_changes::<I::State>(state, event.position, I::parameter_changed);
+            update_parameters(state, event.position);
         } else {
             I::handle_event(state, event);
         }

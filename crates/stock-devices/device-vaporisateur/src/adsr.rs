@@ -35,6 +35,7 @@ impl Adsr {
 
     /// The envelope's UI phase (TS `env.phase`, 0..4 across Attack/Decay/Sustain/Release — the editor's
     /// envelope playhead).
+    #[cfg(target_family = "wasm")]
     pub fn phase(&self) -> f64 {
         self.phase
     }

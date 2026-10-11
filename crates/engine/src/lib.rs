@@ -14,7 +14,11 @@
 //! ALLOCATOR: talc (`WasmDynamicTalc`), a reclaiming allocator that grows linear memory via
 //! `memory.grow` on demand and frees blocks back for reuse. Single-threaded build, so no lock.
 
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(all(not(test), target_family = "wasm"), no_std)]
+#![cfg_attr(feature = "native", allow(dead_code))]
+
+#[cfg(all(feature = "native", target_family = "wasm"))]
+compile_error!("the native engine feature is for native targets; omit it for WASM");
 
 extern crate alloc;
 
@@ -25,7 +29,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
-#[cfg(not(test))]
+#[cfg(all(not(test), not(feature = "native")))]
 use core::cell::UnsafeCell;
 use bindings::value_collection::ValueCollection;
 use crate::tempo_map::{SharedTempoMap, TempoMap};
@@ -362,15 +366,15 @@ const INPUT_CAPACITY: usize = 1 << 20; // initial input scratch (1 MiB); grows o
 /// A process-global cell for the single-threaded wasm module: an `UnsafeCell` asserted `Sync`, the
 /// same shape talc uses for its allocator. SAFETY rests on the engine being driven by one thread,
 /// with no overlapping `&mut` to the same cell.
-#[cfg(not(test))]
+#[cfg(all(not(test), not(feature = "native")))]
 struct Shared<T>(UnsafeCell<T>);
 
 // SAFETY: only the audio thread runs engine code, so there is never concurrent access (the shared
 // memory lets the main thread write sample data, but it never executes the engine).
-#[cfg(not(test))]
+#[cfg(all(not(test), not(feature = "native")))]
 unsafe impl<T> Sync for Shared<T> {}
 
-#[cfg(not(test))]
+#[cfg(all(not(test), not(feature = "native")))]
 impl<T> Shared<T> {
     const fn new(value: T) -> Self {
         Self(UnsafeCell::new(value))
@@ -390,13 +394,13 @@ impl<T> Shared<T> {
 /// these cells and killed the whole run with a bare SIGSEGV / SIGTRAP and no failing test named. A test owns
 /// its own `Engine` anyway, so per-thread instances are what it already assumes it has. Each thread's value is
 /// leaked on first touch, so `get` can hand out a reference that outlives the `LocalKey` borrow.
-#[cfg(test)]
+#[cfg(any(test, feature = "native"))]
 struct Shared<T: 'static>(fn() -> *mut T);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "native"))]
 unsafe impl<T> Sync for Shared<T> {}
 
-#[cfg(test)]
+#[cfg(any(test, feature = "native"))]
 impl<T: 'static> Shared<T> {
     const fn per_thread(resolve: fn() -> *mut T) -> Self {
         Self(resolve)
@@ -412,7 +416,7 @@ impl<T: 'static> Shared<T> {
 /// initialiser is written once and used by both.
 macro_rules! shared_static {
     ($(#[$meta:meta])* $vis:vis static $name:ident: $ty:ty = $init:expr;) => {
-        #[cfg(not(test))]
+        #[cfg(all(not(test), not(feature = "native")))]
         $(#[$meta])*
         $vis static $name: $crate::Shared<$ty> = $crate::Shared::new($init);
 
@@ -423,6 +427,14 @@ macro_rules! shared_static {
                 static CELL: *mut $ty = alloc::boxed::Box::into_raw(alloc::boxed::Box::new($init));
             }
             CELL.with(|cell| *cell)
+        });
+        #[cfg(all(feature = "native", not(test)))]
+        $(#[$meta])*
+        $vis static $name: $crate::Shared<$ty> = $crate::Shared::per_thread(|| {
+            std::thread_local! {
+                static CELL: core::cell::UnsafeCell<$ty> = core::cell::UnsafeCell::new($init);
+            }
+            CELL.with(|cell| cell.get())
         });
     };
 }
@@ -444,8 +456,8 @@ pub(crate) fn note_device_build() {
     unsafe { *DEVICE_BUILDS.get() = DEVICE_BUILDS.get().wrapping_add(1); }
 }
 
-#[no_mangle]
-pub extern "C" fn device_build_count() -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn device_build_count() -> u32 {
     unsafe { *DEVICE_BUILDS.get() }
 }
 
@@ -455,8 +467,8 @@ shared_static! {
     static PARAM_PUSHES: u32 = 0;
 }
 
-#[no_mangle]
-pub extern "C" fn param_push_count() -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn param_push_count() -> u32 {
     unsafe { *PARAM_PUSHES.get() }
 }
 
@@ -467,8 +479,8 @@ shared_static! {
     static TERMINATES: u32 = 0;
 }
 
-#[no_mangle]
-pub extern "C" fn device_terminate_count() -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn device_terminate_count() -> u32 {
     unsafe { *TERMINATES.get() }
 }
 
@@ -636,10 +648,10 @@ shared_static! {
 // The note-bits slot of the unit CURRENTLY reconciling (its instruments capture it at construction —
 // composite slots share their unit's slot). Set around `reconcile_one`'s chain work, cleared after.
 shared_static! {
-    #[cfg(not(test))]
+    #[cfg(all(not(test), not(feature = "native")))]
 static CURRENT_UNIT_NOTE_BITS: Option<engine_env::telemetry::BroadcastSlot> = None;
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "native"))]
 std::thread_local! {
     // Tests run on parallel threads; the production engine is single-threaded, so the Shared cell is only
     // sound there. Per-thread isolation keeps the tests deterministic (the PARAMS_SIGNAL pattern): the
@@ -649,16 +661,16 @@ std::thread_local! {
 }
 
 pub(crate) fn current_unit_note_bits() -> Option<engine_env::telemetry::BroadcastSlot> {
-    #[cfg(not(test))]
+    #[cfg(all(not(test), not(feature = "native")))]
     { unsafe { CURRENT_UNIT_NOTE_BITS.get() }.clone() }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "native"))]
     { CURRENT_UNIT_NOTE_BITS.with(|cell| cell.borrow().clone()) }
 }
 
 pub(crate) fn set_current_unit_note_bits(slot: Option<engine_env::telemetry::BroadcastSlot>) {
-    #[cfg(not(test))]
+    #[cfg(all(not(test), not(feature = "native")))]
     unsafe { *CURRENT_UNIT_NOTE_BITS.get() = slot; }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "native"))]
     CURRENT_UNIT_NOTE_BITS.with(|cell| *cell.borrow_mut() = slot);
 }
 
@@ -745,8 +757,8 @@ fn lifecycle_id(event: &Event) -> u64 {
 /// sample-offset `EventRecord`s directly; a MIDI-fx link descends (routing the fx device's own upstream
 /// pull to the next link) and invokes that device's `process_events`. Reads only `PULL`, never `ENGINE`,
 /// so it is safe to call re-entrantly from inside `render`.
-#[no_mangle]
-pub extern "C" fn host_pull_events(from: f64, to: f64, flags: u32, out_ptr: u32, max: u32) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn host_pull_events(from: f64, to: f64, flags: u32, out_ptr: u32, max: u32) -> u32 {
     let out = unsafe { core::slice::from_raw_parts_mut(out_ptr as *mut EventRecord, max as usize) };
     pull_events_into(from, to, flags, out, out_ptr)
 }
@@ -838,8 +850,8 @@ fn modulation_armed(pull: &PullContext) -> bool {
 /// (INCLUSIVE), so a grid point exactly on a block's start fires (mirrors TS `Fragmentor`'s `ceil`). Returns
 /// `f64::INFINITY` when the CURRENT device has no automated parameter, or while the transport is NOT running
 /// (TS `UpdateClock` emits no update events on a non-transporting block). Reads only `PULL`.
-#[no_mangle]
-pub extern "C" fn host_first_update_position(at: f64) -> f64 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn host_first_update_position(at: f64) -> f64 {
     let pull = unsafe { PULL.get() };
     if !pull.clock_armed {
         return f64::INFINITY;
@@ -857,8 +869,8 @@ pub extern "C" fn host_first_update_position(at: f64) -> f64 {
 /// parameter (so its render simply does not fragment) or while the transport is NOT running (the TS
 /// `UpdateClock` gate). Reads only `PULL` (the current device's clock-armed state, set by its node / the fx
 /// descent).
-#[no_mangle]
-pub extern "C" fn host_next_update_position(after: f64) -> f64 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn host_next_update_position(after: f64) -> f64 {
     let pull = unsafe { PULL.get() };
     if !pull.clock_armed || !(quantum_transporting() || modulation_armed(pull)) {
         return f64::INFINITY;
@@ -876,8 +888,8 @@ pub extern "C" fn host_next_update_position(after: f64) -> f64 {
 /// the path (into `BIND`) and returns the id (the index); the engine observes the field + track after `init`
 /// returns. The host stays mapping-agnostic. Touches no graph and no `&mut Engine`, so it is safe to call
 /// re-entrantly from `init`.
-#[no_mangle]
-pub extern "C" fn host_bind_parameter(path_ptr: u32, path_len: u32) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn host_bind_parameter(path_ptr: u32, path_len: u32) -> u32 {
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u16, path_len as usize) };
     let bind = unsafe { BIND.get() };
     bind.push(path.to_vec());
@@ -893,8 +905,8 @@ pub extern "C" fn host_bind_parameter(path_ptr: u32, path_len: u32) -> u32 {
 /// RECORDS the request (into `BROADCAST_BINDS`) and returns the GLOBAL slot id; `bind_device` creates and
 /// registers the slot after `init` returns. The device fetches the write ptr via `host_broadcast_ptr`.
 /// Touches only its own cells, so it is safe to call re-entrantly from `init`.
-#[no_mangle]
-pub extern "C" fn host_bind_broadcast(path_ptr: u32, path_len: u32, len: u32, package_type: u32) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn host_bind_broadcast(path_ptr: u32, path_len: u32, len: u32, package_type: u32) -> u32 {
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u16, path_len as usize) };
     let registry = unsafe { DEVICE_BROADCASTS.get() };
     let id = match unsafe { DEVICE_BROADCAST_FREE.get() }.pop() {
@@ -907,20 +919,20 @@ pub extern "C" fn host_bind_broadcast(path_ptr: u32, path_len: u32, len: u32, pa
 
 /// The write pointer of a device broadcast slot (0 while unbound). Reads only the registry cell, so a device
 /// may call it lazily from `process`.
-#[no_mangle]
-pub extern "C" fn host_broadcast_ptr(id: u32) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn host_broadcast_ptr(id: u32) -> u32 {
     unsafe { DEVICE_BROADCASTS.get() }.get(id as usize).map_or(0, |entry| entry.0)
 }
 
 /// Whether the UI currently subscribes to a device broadcast slot (round-tripped by the worklet through
 /// `broadcast_set_active`). Producers may skip cold work (the spectrum FFT) while inactive.
-#[no_mangle]
-pub extern "C" fn host_broadcast_active(id: u32) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn host_broadcast_active(id: u32) -> u32 {
     unsafe { DEVICE_BROADCASTS.get() }.get(id as usize).map_or(0, |entry| entry.1 as u32)
 }
 
-#[no_mangle]
-pub extern "C" fn host_observe_sample(path_ptr: u32, path_len: u32) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn host_observe_sample(path_ptr: u32, path_len: u32) -> u32 {
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u16, path_len as usize) };
     let obs = unsafe { SAMPLE_OBS.get() };
     obs.push(path.to_vec());
@@ -932,8 +944,8 @@ pub extern "C" fn host_observe_sample(path_ptr: u32, path_len: u32) -> u32 {
 /// after `init` the engine reactively tracks the pointer, resolving + requesting the soundfont and delivering
 /// the handle via `soundfont_changed`. Touches no `&mut Engine`, so it is safe from `init`. Mirrors
 /// `host_observe_sample`.
-#[no_mangle]
-pub extern "C" fn host_observe_soundfont(path_ptr: u32, path_len: u32) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn host_observe_soundfont(path_ptr: u32, path_len: u32) -> u32 {
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u16, path_len as usize) };
     let obs = unsafe { SOUNDFONT_OBS.get() };
     obs.push(path.to_vec());
@@ -944,8 +956,8 @@ pub extern "C" fn host_observe_soundfont(path_ptr: u32, path_len: u32) -> u32 {
 /// Only RECORDS the path (into `FIELD_OBS`) and returns its id; after `init` the engine `catchup_and_subscribe`s
 /// it and delivers the value through the device's `field_changed`. NOT a parameter (no automation). Touches no
 /// `&mut Engine`, so it is safe from `init`.
-#[no_mangle]
-pub extern "C" fn host_observe_field(path_ptr: u32, path_len: u32) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn host_observe_field(path_ptr: u32, path_len: u32) -> u32 {
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u16, path_len as usize) };
     let obs = unsafe { FIELD_OBS.get() };
     obs.push(FieldObs {path: path.to_vec(), target_key: 0});
@@ -956,8 +968,8 @@ pub extern "C" fn host_observe_field(path_ptr: u32, path_len: u32) -> u32 {
 /// TARGET box's STRING field `field_key`: on catch-up and every set / repoint / clear the engine resolves the
 /// target and delivers its string through `field_changed` (`FIELD_KIND_STRING`, empty = unbound). Shares the
 /// `FIELD_OBS` id space with `host_observe_field`. Touches no `&mut Engine`, so it is safe from `init`.
-#[no_mangle]
-pub extern "C" fn host_observe_target_string(path_ptr: u32, path_len: u32, field_key: u32) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn host_observe_target_string(path_ptr: u32, path_len: u32, field_key: u32) -> u32 {
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u16, path_len as usize) };
     let obs = unsafe { FIELD_OBS.get() };
     obs.push(FieldObs {path: path.to_vec(), target_key: field_key as u16});
@@ -967,8 +979,8 @@ pub extern "C" fn host_observe_target_string(path_ptr: u32, path_len: u32, field
 /// Host import a SCRIPTABLE device calls from `init` to learn its own box uuid (16 bytes written to `out16_ptr`),
 /// which it passes to the JS script bridge so the bridge finds the matching user `Processor`. Reads only the
 /// `CURRENT_DEVICE_UUID` cell the engine set before `init`, never `&mut Engine`.
-#[no_mangle]
-pub extern "C" fn host_self_uuid(out16_ptr: u32) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn host_self_uuid(out16_ptr: u32) {
     let uuid = unsafe { *CURRENT_DEVICE_UUID.get() };
     unsafe { core::ptr::copy_nonoverlapping(uuid.as_ptr(), out16_ptr as *mut u8, 16); }
 }
@@ -977,8 +989,8 @@ pub extern "C" fn host_self_uuid(out16_ptr: u32) {
 /// path. Records the path (the engine resolves it after `init`) and returns the device-facing PORT id: `2` for
 /// the first sidechain, `3` for the next, and so on, after the reserved `MAIN_INPUT` (1). Touches no
 /// `&mut Engine`, so it is safe from `init`.
-#[no_mangle]
-pub extern "C" fn host_bind_sidechain(path_ptr: u32, path_len: u32) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn host_bind_sidechain(path_ptr: u32, path_len: u32) -> u32 {
     let path = unsafe { core::slice::from_raw_parts(path_ptr as *const u16, path_len as usize) };
     let bind = unsafe { SIDECHAIN_BIND.get() };
     bind.push(path.to_vec());
@@ -989,8 +1001,8 @@ pub extern "C" fn host_bind_sidechain(path_ptr: u32, path_len: u32) -> u32 {
 /// `out_ptr` and return 1 if the port is wired, else 0. `INPUTS` holds the current effect's ports (swapped in
 /// by `PluginAudioEffect::process`): id 1 the through-signal, ids 2+ its resolved sidechains. Reads `INPUTS`
 /// read-only, so it never aliases the `&mut Engine` the render path holds, exactly like `host_resolve_sample`.
-#[no_mangle]
-pub extern "C" fn host_resolve_input(id: u32, out_ptr: u32) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn host_resolve_input(id: u32, out_ptr: u32) -> u32 {
     let ports = unsafe { INPUTS.get() };
     for &(port_id, left, right) in ports.iter() {
         if port_id == id {
@@ -1005,8 +1017,8 @@ pub extern "C" fn host_resolve_input(id: u32, out_ptr: u32) -> u32 {
 /// `RootBox.baseFrequency`): the Vaporisateur reads it per note-on, mirroring TS `computeFrequency`. Reads
 /// only the `BASE_FREQUENCY` cell, so it is safe re-entrantly during render, exactly like
 /// `host_resolve_sample` reading `SAMPLES`.
-#[no_mangle]
-pub extern "C" fn host_base_frequency() -> f32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn host_base_frequency() -> f32 {
     unsafe { *BASE_FREQUENCY.get() }
 }
 
@@ -1015,8 +1027,8 @@ pub extern "C" fn host_base_frequency() -> f32 {
 /// it handed out, and writes the changed `(id, value)` into `out` (a `ParamChange` scratch in the device's
 /// memory), returning the count. Static parameters are pushed at build / edit time, not here. Reads only
 /// `PULL` (the current device's params, swapped in by its node), so it is safe to call from inside `process`.
-#[no_mangle]
-pub extern "C" fn host_update_parameters(position: f64, out_ptr: u32, max: u32) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn host_update_parameters(position: f64, out_ptr: u32, max: u32) -> u32 {
     let out = unsafe { core::slice::from_raw_parts_mut(out_ptr as *mut ParamChange, max as usize) };
     update_parameters(position, out)
 }
@@ -1049,8 +1061,8 @@ fn update_parameters(position: f64, out: &mut [ParamChange]) -> u32 {
 /// Host import a (generative) device calls to map a pulse position to its sample offset within the current
 /// quantum, resolved against the block containing `pulse`. An arpeggiator uses it to time the events it
 /// emits on a rate grid. Reads only `PULL`, like `host_pull_events`.
-#[no_mangle]
-pub extern "C" fn host_pulse_to_offset(pulse: f64) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn host_pulse_to_offset(pulse: f64) -> u32 {
     let pull = unsafe { PULL.get() };
     if pull.blocks.is_null() {
         return 0;
@@ -2368,21 +2380,21 @@ fn write_engine_state(transport: &Transport, state: &mut [u8], is_recording: boo
 
 // ---- The C ABI: thin wrappers over the single `Engine` + the I/O buffers. ----
 
-#[no_mangle]
-pub extern "C" fn input_ptr() -> *mut u8 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn input_ptr() -> *mut u8 {
     unsafe { INPUT.get().as_mut_ptr() }
 }
 
-#[no_mangle]
-pub extern "C" fn input_capacity() -> usize {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn input_capacity() -> usize {
     unsafe { INPUT.get().capacity() }
 }
 
 /// Ensure the input scratch can hold `len` bytes, growing it (and keeping the larger buffer) if needed.
 /// Returns the buffer's address, which a grow may have moved, so the host must use this result. Cheap when
 /// `len` already fits (the common case), so the host can call it before every transaction.
-#[no_mangle]
-pub extern "C" fn input_reserve(len: usize) -> *mut u8 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn input_reserve(len: usize) -> *mut u8 {
     unsafe {
         let input = INPUT.get();
         if input.capacity() < len {
@@ -2416,13 +2428,13 @@ fn perf_now() -> f64 {
 // ---- live-telemetry BROADCAST TABLE (plans/wasm-audio/live-broadcaster.md) -------------------------------
 
 /// Bumps whenever the broadcast table changed (a register or a sweep); the worklet re-reads the table then.
-#[no_mangle]
-pub extern "C" fn broadcast_generation() -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn broadcast_generation() -> u32 {
     unsafe { ENGINE.get().as_ref().map_or(0, |engine| engine.broadcasts.generation()) }
 }
 
-#[no_mangle]
-pub extern "C" fn broadcast_count() -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn broadcast_count() -> u32 {
     unsafe { ENGINE.get().as_ref().map_or(0, |engine| engine.broadcasts.len() as u32) }
 }
 
@@ -2430,8 +2442,8 @@ pub extern "C" fn broadcast_count() -> u32 {
 /// `[uuid 16][package_type u32][ptr u32][len u32][keys_count u32][keys u16 x 8]`. Returns 1, or 0 when out
 /// of range OR when the entry's owning slot died (its `ptr` points into freed heap — serving it would hand
 /// the worklet a view over allocator garbage; the next sweep drops it).
-#[no_mangle]
-pub extern "C" fn broadcast_entry(index: u32, out_ptr: u32) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn broadcast_entry(index: u32, out_ptr: u32) -> u32 {
     unsafe {
         let Some(engine) = ENGINE.get().as_ref() else { return 0 };
         let Some(entry) = engine.broadcasts.entry(index as usize) else { return 0 };
@@ -2456,8 +2468,8 @@ pub extern "C" fn broadcast_entry(index: u32, out_ptr: u32) -> u32 {
 /// [processors, labels, queue_len, queue_cap, next_node_id, output_registry, graph_vertices,
 ///  box_count, subscription_count, broadcasts, audio_units, output_registry_engine,
 ///  sample_slots_ever, sample_slots_live].
-#[no_mangle]
-pub extern "C" fn debug_probe(out_ptr: u32) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn debug_probe(out_ptr: u32) {
     unsafe {
         let Some(engine) = ENGINE.get().as_ref() else { return };
         let out = core::slice::from_raw_parts_mut(out_ptr as *mut u32, 14);
@@ -2475,8 +2487,8 @@ pub extern "C" fn debug_probe(out_ptr: u32) {
 }
 
 /// The UI's subscription flag round-trip (a producer MAY skip cold work; meters are always-on today).
-#[no_mangle]
-pub extern "C" fn broadcast_set_active(index: u32, active: u32) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn broadcast_set_active(index: u32, active: u32) {
     unsafe {
         if let Some(engine) = ENGINE.get().as_mut() {
             engine.broadcasts.set_active(index as usize, active != 0);
@@ -2495,8 +2507,8 @@ pub extern "C" fn broadcast_set_active(index: u32, active: u32) {
 }
 
 /// Enable (or re-zero) per-node render profiling.
-#[no_mangle]
-pub extern "C" fn profile_enable() {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn profile_enable() {
     unsafe {
         if let Some(engine) = ENGINE.get().as_mut() {
             engine.context.profile_enable(perf_now);
@@ -2507,8 +2519,8 @@ pub extern "C" fn profile_enable() {
 /// Write the profile as a UTF-8 text table into `out_ptr` (client-reserved via `input_reserve`), sorted by
 /// accumulated time descending: `micros<TAB>label` per line, headed by `quanta <n>`. Returns bytes written
 /// (truncated to `max`). Diagnostic path, allocation is fine here.
-#[no_mangle]
-pub extern "C" fn profile_report(out_ptr: u32, max: u32) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn profile_report(out_ptr: u32, max: u32) -> u32 {
     unsafe {
         let Some(engine) = ENGINE.get().as_mut() else { return 0 };
         let (mut entries, quanta) = engine.context.profile_report();
@@ -2527,8 +2539,8 @@ pub extern "C" fn profile_report(out_ptr: u32, max: u32) -> u32 {
 /// Refresh the 32-byte checksum buffer from the current graph and return its pointer. Computing the
 /// checksum is a full-graph walk (O(all boxes)), so it runs ONLY here — on the throttled verification
 /// round-trip (~1/s), never per transaction. Called from the worklet's checksum-verify path.
-#[no_mangle]
-pub extern "C" fn checksum_ptr() -> *const u8 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn checksum_ptr() -> *const u8 {
     unsafe {
         if let Some(engine) = ENGINE.get().as_ref() {
             CHECKSUM.get().copy_from_slice(&engine.checksum());
@@ -2537,31 +2549,31 @@ pub extern "C" fn checksum_ptr() -> *const u8 {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn output_ptr() -> *const f32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn output_ptr() -> *const f32 {
     unsafe { OUTPUT.get().as_ptr() }
 }
 
-#[no_mangle]
-pub extern "C" fn output_len() -> usize {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn output_len() -> usize {
     RENDER_QUANTUM * 2
 }
 
-#[no_mangle]
-pub extern "C" fn engine_state_ptr() -> *const u8 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn engine_state_ptr() -> *const u8 {
     unsafe { ENGINE_STATE.get().as_ptr() }
 }
 
-#[no_mangle]
-pub extern "C" fn engine_state_len() -> usize {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn engine_state_len() -> usize {
     ENGINE_STATE_LEN
 }
 
 /// Reset to a fresh engine with an empty graph, KEEPING the sample rate the engine was created with
 /// (call before replaying a fresh session). No-op if `init` has not created the engine yet: the sample
 /// rate is only known from creation, so there is nothing to reset to before then.
-#[no_mangle]
-pub extern "C" fn reset() {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn reset() {
     unsafe {
         if let Some(sample_rate) = ENGINE.get().as_ref().map(|engine| engine.sample_rate) {
             *ENGINE.get() = Some(Engine::new(sample_rate));
@@ -2573,8 +2585,8 @@ pub extern "C" fn reset() {
 
 /// Apply one forward-only transaction from the first `len` input bytes, refreshing the checksum
 /// buffer. Returns 0 on success, 1 on a decode/apply error or if the engine was not created (`init`).
-#[no_mangle]
-pub extern "C" fn apply_updates(len: usize) -> i32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn apply_updates(len: usize) -> i32 {
     unsafe {
         let engine = match ENGINE.get().as_mut() {
             Some(engine) => engine,
@@ -2597,8 +2609,8 @@ pub extern "C" fn apply_updates(len: usize) -> i32 {
 
 /// Initialize the engine for `sample_rate`: empty graph, a STOPPED transport (the UI starts playback with
 /// `play`), and a metronome.
-#[no_mangle]
-pub extern "C" fn init(sample_rate: f32) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn init(sample_rate: f32) {
     let engine = Engine::new(sample_rate);
     unsafe {
         *ENGINE.get() = Some(engine);
@@ -2608,8 +2620,8 @@ pub extern "C" fn init(sample_rate: f32) {
 }
 
 /// Render one 128-frame quantum into the output buffer and refresh the EngineState back-channel.
-#[no_mangle]
-pub extern "C" fn render() {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn render() {
     unsafe {
         if let Some(engine) = ENGINE.get().as_mut() {
             engine.render(OUTPUT.get(), ENGINE_STATE.get());
@@ -2626,8 +2638,8 @@ pub extern "C" fn render() {
 /// `metronome_stem` (TS `exportConfiguration.metronome.stem`) appends the metronome as one further pair
 /// AFTER the unit stems, so it is part of the same allocation rather than a second call that could leave the
 /// staging a pair short.
-#[no_mangle]
-pub extern "C" fn set_stem_export(count: u32, metronome_stem: u32) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn set_stem_export(count: u32, metronome_stem: u32) {
     unsafe {
         if let Some(engine) = ENGINE.get().as_mut() {
             engine.metronome_stem = metronome_stem != 0;
@@ -2656,8 +2668,8 @@ pub extern "C" fn set_stem_export(count: u32, metronome_stem: u32) {
 /// FREEZE step 1 (TS `EngineCommands.setFrozenAudio`): allocate the pending PCM buffer (ALWAYS
 /// `frame_count * 2` f32, the final planar stereo layout) and return its write pointer; the writer fills
 /// plane 0 (and plane 1 when stereo), then calls `set_frozen_audio` with the unit uuid in the input scratch.
-#[no_mangle]
-pub extern "C" fn frozen_allocate(frame_count: u32, _channels: u32) -> *mut f32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn frozen_allocate(frame_count: u32, _channels: u32) -> *mut f32 {
     unsafe {
         match ENGINE.get().as_mut() {
             Some(engine) => {
@@ -2673,8 +2685,8 @@ pub extern "C" fn frozen_allocate(frame_count: u32, _channels: u32) -> *mut f32 
 /// whose 16-byte uuid sits in the input scratch, and re-wire it to frozen playback. Takes the pending
 /// buffer AS-IS (no allocation, no copy — it already has the stereo layout); a mono freeze duplicates
 /// plane 0 into plane 1 in place.
-#[no_mangle]
-pub extern "C" fn set_frozen_audio(frame_count: u32, channels: u32, sample_rate: f32) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn set_frozen_audio(frame_count: u32, channels: u32, sample_rate: f32) {
     unsafe {
         if let Some(engine) = ENGINE.get().as_mut() {
             let mut uuid = [0u8; 16];
@@ -2691,8 +2703,8 @@ pub extern "C" fn set_frozen_audio(frame_count: u32, channels: u32, sample_rate:
 
 /// UNFREEZE (TS `setFrozenAudio(uuid, null)`): drop the unit's frozen PCM (uuid in the input scratch) and
 /// re-wire its live chain.
-#[no_mangle]
-pub extern "C" fn clear_frozen_audio() {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn clear_frozen_audio() {
     unsafe {
         if let Some(engine) = ENGINE.get().as_mut() {
             let mut uuid = [0u8; 16];
@@ -2703,8 +2715,8 @@ pub extern "C" fn clear_frozen_audio() {
 }
 
 /// The stem staging base pointer (`stems * 2 * 128` f32, planar per stem).
-#[no_mangle]
-pub extern "C" fn stem_output_ptr() -> *const f32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn stem_output_ptr() -> *const f32 {
     unsafe {
         match ENGINE.get().as_ref() {
             Some(engine) => engine.stem_staging.as_ptr(),
@@ -2715,23 +2727,23 @@ pub extern "C" fn stem_output_ptr() -> *const f32 {
 
 /// The EFFECTS-monitoring INPUT staging (`MONITOR_CHANNELS * 128` f32, channel-planar): the worklet writes
 /// the live input channels here BEFORE each `render`.
-#[no_mangle]
-pub extern "C" fn monitor_input_ptr() -> *mut f32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn monitor_input_ptr() -> *mut f32 {
     unsafe { MONITOR_INPUT.get().as_mut_ptr() }
 }
 
 /// The EFFECTS-monitoring OUTPUT staging (same layout): each mapped unit's strip output lands here after
 /// `render`; the worklet forwards it on its second output (the MonitoringRouter return).
-#[no_mangle]
-pub extern "C" fn monitor_output_ptr() -> *const f32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn monitor_output_ptr() -> *const f32 {
     unsafe { MONITOR_OUTPUT.get().as_ptr() }
 }
 
 /// Replace the EFFECTS-monitoring map (TS `EngineCommands.updateMonitoringMap`): `count` records of
 /// `[unit uuid 16][left channel i32 LE][right channel i32 LE]` (right -1 = mono) in the input scratch.
 /// Every unit leaving or joining the map re-wires (the `MonitorMix` injector joins / leaves its chain).
-#[no_mangle]
-pub extern "C" fn set_monitoring_map(count: u32) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn set_monitoring_map(count: u32) {
     unsafe {
         if let Some(engine) = ENGINE.get().as_mut() {
             let bytes = core::slice::from_raw_parts(INPUT.get().as_ptr(), count as usize * 24);
@@ -2749,8 +2761,8 @@ pub extern "C" fn set_monitoring_map(count: u32) {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn play() {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn play() {
     unsafe {
         if let Some(engine) = ENGINE.get().as_mut() {
             engine.play()
@@ -2758,8 +2770,8 @@ pub extern "C" fn play() {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn pause() {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn pause() {
     unsafe {
         if let Some(engine) = ENGINE.get().as_mut() {
             engine.pause()
@@ -2767,8 +2779,8 @@ pub extern "C" fn pause() {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn stop() {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn stop() {
     unsafe {
         if let Some(engine) = ENGINE.get().as_mut() {
             engine.stop()
@@ -2778,8 +2790,8 @@ pub extern "C" fn stop() {
 
 /// Arm recording (TS `EngineCommands.prepareRecordingState`): `count_in_bars` comes from the caller's
 /// preferences (the engine owns the signature). See `Engine::prepare_recording_state`.
-#[no_mangle]
-pub extern "C" fn prepare_recording_state(count_in: i32, count_in_bars: f64) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn prepare_recording_state(count_in: i32, count_in_bars: f64) {
     unsafe {
         if let Some(engine) = ENGINE.get().as_mut() {
             engine.prepare_recording_state(count_in != 0, count_in_bars);
@@ -2788,8 +2800,8 @@ pub extern "C" fn prepare_recording_state(count_in: i32, count_in_bars: f64) {
 }
 
 /// End recording (TS `EngineCommands.stopRecording`): drops the flags and pauses the transport.
-#[no_mangle]
-pub extern "C" fn stop_recording() {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn stop_recording() {
     unsafe {
         if let Some(engine) = ENGINE.get().as_mut() {
             engine.stop_recording();
@@ -2800,8 +2812,8 @@ pub extern "C" fn stop_recording() {
 /// Exclude a note region from playback (TS `EngineCommands.ignoreNoteRegion`): the region currently being
 /// RECORDED INTO must not re-trigger the notes being captured. The 16-byte region uuid is written into the
 /// input scratch first. Cleared on stop / stopRecording.
-#[no_mangle]
-pub extern "C" fn ignore_note_region() {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn ignore_note_region() {
     let mut uuid = [0u8; 16];
     uuid.copy_from_slice(unsafe { core::slice::from_raw_parts(INPUT.get().as_ptr(), 16) });
     let ignored = unsafe { IGNORED_REGIONS.get() };
@@ -2813,8 +2825,8 @@ pub extern "C" fn ignore_note_region() {
 /// Put an automation lane under MANUAL control (TS `EngineCommands.suspendAutomation`, issue #347): its
 /// parameter reads its own field value until the transport stops, so a knob or a CC is heard at once instead
 /// of fighting the curve. The 16-byte lane uuid is written into the input scratch first.
-#[no_mangle]
-pub extern "C" fn suspend_automation() {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn suspend_automation() {
     let mut uuid = [0u8; 16];
     uuid.copy_from_slice(unsafe { core::slice::from_raw_parts(INPUT.get().as_ptr(), 16) });
     let suspended = unsafe { SUSPENDED_AUTOMATION.get() };
@@ -2823,8 +2835,8 @@ pub extern "C" fn suspend_automation() {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn set_position(position: f64) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn set_position(position: f64) {
     unsafe {
         if let Some(engine) = ENGINE.get().as_mut() {
             engine.set_position(position)
@@ -2848,8 +2860,8 @@ fn input_uuid() -> Uuid {
 /// through the clip's `clips` pointer, key 1); `schedule_clip_stop` takes a TRACK uuid. Transitions queue
 /// for `clip_changes_take`: records of [uuid 16][kind u32 LE] (0 started, 1 stopped, 2 obsolete), feeding
 /// the notifyClipSequenceChanges back-channel.
-#[no_mangle]
-pub extern "C" fn schedule_clip_play() {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn schedule_clip_play() {
     unsafe {
         if let Some(engine) = ENGINE.get().as_mut() {
             engine.schedule_clip_play(input_uuid());
@@ -2857,8 +2869,8 @@ pub extern "C" fn schedule_clip_play() {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn schedule_clip_stop() {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn schedule_clip_stop() {
     unsafe {
         if let Some(engine) = ENGINE.get().as_mut() {
             engine.clip_sequencer.borrow_mut().schedule_stop(input_uuid());
@@ -2866,8 +2878,8 @@ pub extern "C" fn schedule_clip_stop() {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn clip_changes_count() -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn clip_changes_count() -> u32 {
     unsafe {
         match ENGINE.get().as_ref() {
             Some(engine) => engine.clip_sequencer.borrow().changes_len() as u32,
@@ -2876,8 +2888,8 @@ pub extern "C" fn clip_changes_count() -> u32 {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn clip_changes_take(out_ptr: u32) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn clip_changes_take(out_ptr: u32) -> u32 {
     unsafe {
         let Some(engine) = ENGINE.get().as_mut() else { return 0 };
         let mut count: u32 = 0;
@@ -2902,8 +2914,8 @@ pub extern "C" fn clip_changes_take(out_ptr: u32) -> u32 {
 /// fall-through, a seek into another section). Changes queue as 24-byte records
 /// [uuid 16][count u32 LE][flag u32 LE: 1 active marker, 0 none] drained via `marker_changes_take`
 /// (the clip-changes pattern; reserve `marker_changes_count() * 24` input bytes first).
-#[no_mangle]
-pub extern "C" fn marker_changes_count() -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn marker_changes_count() -> u32 {
     unsafe {
         match ENGINE.get().as_ref() {
             Some(engine) => engine.marker_changes.len() as u32,
@@ -2912,8 +2924,8 @@ pub extern "C" fn marker_changes_count() -> u32 {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn marker_changes_take(out_ptr: u32) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn marker_changes_take(out_ptr: u32) -> u32 {
     unsafe {
         let Some(engine) = ENGINE.get().as_mut() else { return 0 };
         let base = out_ptr as usize;
@@ -2934,8 +2946,8 @@ pub extern "C" fn marker_changes_take(out_ptr: u32) -> u32 {
 /// (reserve `midi_out_count() * 16` input bytes first). `device` resolves to the `MIDIOutputBox.id` string
 /// via `midi_out_device_id` (UTF-8 written to out_ptr, byte length returned; 0 = unknown number) — numbers
 /// are stable first-seen indices, so the worklet caches the mapping.
-#[no_mangle]
-pub extern "C" fn midi_out_count() -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn midi_out_count() -> u32 {
     unsafe {
         match ENGINE.get().as_ref() {
             Some(engine) => engine.midi_out.borrow().queue_len() as u32,
@@ -2944,8 +2956,8 @@ pub extern "C" fn midi_out_count() -> u32 {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn midi_out_take(out_ptr: u32) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn midi_out_take(out_ptr: u32) -> u32 {
     unsafe {
         let Some(engine) = ENGINE.get().as_mut() else { return 0 };
         let base = out_ptr as usize;
@@ -2963,8 +2975,8 @@ pub extern "C" fn midi_out_take(out_ptr: u32) -> u32 {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn midi_out_device_id(num: u32, out_ptr: u32, max: u32) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn midi_out_device_id(num: u32, out_ptr: u32, max: u32) -> u32 {
     unsafe {
         let Some(engine) = ENGINE.get().as_ref() else { return 0 };
         let midi = engine.midi_out.borrow();
@@ -2976,8 +2988,8 @@ pub extern "C" fn midi_out_device_id(num: u32, out_ptr: u32, max: u32) -> u32 {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn note_signal_on(pitch: u32, velocity: f32) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn note_signal_on(pitch: u32, velocity: f32) {
     unsafe {
         if let Some(engine) = ENGINE.get().as_ref() {
             engine.note_signal(input_uuid(), audio_unit::NoteSignal::On {pitch: pitch as u8, velocity})
@@ -2985,8 +2997,8 @@ pub extern "C" fn note_signal_on(pitch: u32, velocity: f32) {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn note_signal_off(pitch: u32) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn note_signal_off(pitch: u32) {
     unsafe {
         if let Some(engine) = ENGINE.get().as_ref() {
             engine.note_signal(input_uuid(), audio_unit::NoteSignal::Off {pitch: pitch as u8})
@@ -2994,8 +3006,8 @@ pub extern "C" fn note_signal_off(pitch: u32) {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn note_signal_audition(pitch: u32, duration: f64, velocity: f32) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn note_signal_audition(pitch: u32, duration: f64, velocity: f32) {
     unsafe {
         if let Some(engine) = ENGINE.get().as_ref() {
             engine.note_signal(input_uuid(), audio_unit::NoteSignal::Audition {pitch: pitch as u8, duration, velocity})
@@ -3004,8 +3016,8 @@ pub extern "C" fn note_signal_audition(pitch: u32, duration: f64, velocity: f32)
 }
 
 /// TS `settings.recording.allowTakes`: while recording WITHOUT takes the loop wrap is suppressed.
-#[no_mangle]
-pub extern "C" fn set_allow_takes(enabled: i32) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn set_allow_takes(enabled: i32) {
     unsafe {
         if let Some(engine) = ENGINE.get().as_mut() {
             engine.allow_takes = enabled != 0
@@ -3014,8 +3026,8 @@ pub extern "C" fn set_allow_takes(enabled: i32) {
 }
 
 /// TS `settings.playback.pauseOnLoopDisabled`: reaching the loop end PAUSES instead of wrapping.
-#[no_mangle]
-pub extern "C" fn set_pause_on_loop_disabled(enabled: i32) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn set_pause_on_loop_disabled(enabled: i32) {
     unsafe {
         if let Some(engine) = ENGINE.get().as_mut() {
             engine.pause_on_loop_disabled = enabled != 0
@@ -3024,8 +3036,8 @@ pub extern "C" fn set_pause_on_loop_disabled(enabled: i32) {
 }
 
 /// The `playback.truncateNotesAtRegionEnd` preference (TS `NoteSequencer` reads it live per block).
-#[no_mangle]
-pub extern "C" fn set_truncate_notes_at_region_end(enabled: i32) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn set_truncate_notes_at_region_end(enabled: i32) {
     unsafe {
         if let Some(engine) = ENGINE.get().as_ref() {
             engine.truncate_pref.set(enabled != 0)
@@ -3033,8 +3045,8 @@ pub extern "C" fn set_truncate_notes_at_region_end(enabled: i32) {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn set_metronome_enabled(enabled: i32) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn set_metronome_enabled(enabled: i32) {
     unsafe {
         if let Some(engine) = ENGINE.get().as_mut() {
             engine.set_metronome_enabled(enabled != 0)
@@ -3044,8 +3056,8 @@ pub extern "C" fn set_metronome_enabled(enabled: i32) {
 
 /// The metronome preferences (TS `preferences.settings.metronome`), forwarded by the worklet's
 /// engine-preferences subscriptions: click gain in dB (<= 0).
-#[no_mangle]
-pub extern "C" fn set_metronome_gain(gain_db: f32) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn set_metronome_gain(gain_db: f32) {
     unsafe {
         if let Some(engine) = ENGINE.get().as_mut() {
             engine.metronome.set_gain(gain_db)
@@ -3054,8 +3066,8 @@ pub extern "C" fn set_metronome_gain(gain_db: f32) {
 }
 
 /// Beat sub-division (1 | 2 | 4 | 8): clicks every `1 / (denominator * division)` note.
-#[no_mangle]
-pub extern "C" fn set_metronome_beat_sub_division(division: u32) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn set_metronome_beat_sub_division(division: u32) {
     unsafe {
         if let Some(engine) = ENGINE.get().as_mut() {
             engine.metronome.set_beat_sub_division(division)
@@ -3064,8 +3076,8 @@ pub extern "C" fn set_metronome_beat_sub_division(division: u32) {
 }
 
 /// Monophonic clicks: a new click fades every sounding one out over 5 ms (TS `Click.fadeOut`).
-#[no_mangle]
-pub extern "C" fn set_metronome_monophonic(enabled: i32) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn set_metronome_monophonic(enabled: i32) {
     unsafe {
         if let Some(engine) = ENGINE.get().as_mut() {
             engine.metronome.set_monophonic(enabled != 0)
@@ -3076,8 +3088,8 @@ pub extern "C" fn set_metronome_monophonic(enabled: i32) {
 /// CLICK-SOUND upload step 1 (TS `EngineCommands.loadClickSound`, the frozen-audio pattern): allocate
 /// the pending PCM buffer (`frame_count * channels` f32, planar) and return its write pointer; the
 /// worklet fills the planes, then calls `set_click_sound`.
-#[no_mangle]
-pub extern "C" fn click_allocate(frame_count: u32, channels: u32) -> *mut f32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn click_allocate(frame_count: u32, channels: u32) -> *mut f32 {
     unsafe {
         match ENGINE.get().as_mut() {
             Some(engine) => {
@@ -3091,8 +3103,8 @@ pub extern "C" fn click_allocate(frame_count: u32, channels: u32) -> *mut f32 {
 
 /// CLICK-SOUND upload step 2: hand the pending PCM to the metronome as click `index` (0 downbeat,
 /// 1 beat), keeping the sound's own sample rate (playback resamples like the TS `Click`).
-#[no_mangle]
-pub extern "C" fn set_click_sound(index: u32, frame_count: u32, channels: u32, sample_rate: f32) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn set_click_sound(index: u32, frame_count: u32, channels: u32, sample_rate: f32) {
     unsafe {
         if let Some(engine) = ENGINE.get().as_mut() {
             let frames = core::mem::take(&mut engine.click_pending);
@@ -3103,8 +3115,8 @@ pub extern "C" fn set_click_sound(index: u32, frame_count: u32, channels: u32, s
 }
 
 /// Bind the synced `TimelineBox`. Returns 0 on success, 1 if absent.
-#[no_mangle]
-pub extern "C" fn bind() -> i32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn bind() -> i32 {
     unsafe {
         match ENGINE.get().as_mut() {
             Some(engine) => engine.bind(),
@@ -3115,8 +3127,8 @@ pub extern "C" fn bind() -> i32 {
 
 /// Allocate `size` bytes of engine (talc) memory for a loading device and return the address. The host
 /// loader uses this for a device's relocated data region (its `__memory_base`) and its stack.
-#[no_mangle]
-pub extern "C" fn device_alloc(size: u32) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn device_alloc(size: u32) -> u32 {
     unsafe {
         match ENGINE.get().as_mut() {
             Some(engine) => engine.device_alloc(size as usize),
@@ -3131,9 +3143,9 @@ pub extern "C" fn device_alloc(size: u32) -> u32 {
 /// when the device exports none). `terminate_index` fires once, only when the device's INSTANCE dies (a
 /// genuine removal), never on a chain-edit survivor. Returns the device id. Call once per device, before
 /// `bind` (which builds the graph and wires devices).
-#[no_mangle]
+#[cfg_attr(not(feature = "native"), no_mangle)]
 #[allow(clippy::too_many_arguments)] // one positional arg per device export, matching the loader's call
-pub extern "C" fn device_register(process_index: u32, state_size: u32, kind: u32, init_index: u32, parameter_changed_index: u32, field_changed_index: u32, sample_changed_index: u32, soundfont_changed_index: u32, reset_index: u32, terminate_index: u32, midi_effects_field: u32, audio_effects_field: u32, param_collection_field: u32, sample_collection_field: u32) -> u32 {
+pub(crate) extern "C" fn device_register(process_index: u32, state_size: u32, kind: u32, init_index: u32, parameter_changed_index: u32, field_changed_index: u32, sample_changed_index: u32, soundfont_changed_index: u32, reset_index: u32, terminate_index: u32, midi_effects_field: u32, audio_effects_field: u32, param_collection_field: u32, sample_collection_field: u32) -> u32 {
     unsafe {
         match ENGINE.get().as_mut() {
             Some(engine) => engine.device_register(process_index, state_size, kind, init_index, parameter_changed_index, field_changed_index, sample_changed_index, soundfont_changed_index, reset_index, terminate_index, midi_effects_field, audio_effects_field, param_collection_field, sample_collection_field),
@@ -3146,8 +3158,8 @@ pub extern "C" fn device_register(process_index: u32, state_size: u32, kind: u32
 /// name into the input buffer (first `name_len` bytes) and calls this once per device after registering it.
 /// This table is the entire device-to-plugin glue; the engine instantiates a device box by looking its
 /// type up here.
-#[no_mangle]
-pub extern "C" fn device_set_box_type(device_id: u32, name_len: usize) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn device_set_box_type(device_id: u32, name_len: usize) {
     unsafe {
         let engine = match ENGINE.get().as_mut() {
             Some(engine) => engine,
@@ -3164,9 +3176,9 @@ pub extern "C" fn device_set_box_type(device_id: u32, name_len: usize) {
 /// writes the UTF-8 composite box name into the input buffer (first `name_len` bytes) and passes the child
 /// collection's host field key + the child index/routing key. Mirrors `device_set_box_type`; the engine reads
 /// no composite specifics beyond this, so a composite box plays with zero engine changes.
-#[no_mangle]
+#[cfg_attr(not(feature = "native"), no_mangle)]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn composite_register(name_len: usize, children_field: u32, index_key: u32, exclude_key: u32,
+pub(crate) extern "C" fn composite_register(name_len: usize, children_field: u32, index_key: u32, exclude_key: u32,
                                      cell_instrument_field: u32, cell_midi_field: u32, cell_audio_field: u32, child_enabled_key: u32,
                                      child_mute_key: u32, child_solo_key: u32, child_volume_key: u32, child_pan_key: u32) {
     unsafe {
@@ -3186,9 +3198,9 @@ pub extern "C" fn composite_register(name_len: usize, children_field: u32, index
 /// Register an EFFECT composite box type (a parallel fx / note stack): its entry collection + the entry box's
 /// field keys + the composite's dry / wet + input tap. The sibling of `composite_register`; the engine reads no
 /// specifics beyond this record, so a new split container needs no engine change.
-#[no_mangle]
+#[cfg_attr(not(feature = "native"), no_mangle)]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn effect_composite_register(name_len: usize, kind: u32, distributor: u32, entries_field: u32,
+pub(crate) extern "C" fn effect_composite_register(name_len: usize, kind: u32, distributor: u32, entries_field: u32,
                                             index_key: u32, chain_field: u32, label_key: u32, gain_key: u32,
                                             pan_key: u32, mute_key: u32, solo_key: u32, dry_key: u32, wet_key: u32,
                                             input_tap_field: u32, crossover1_key: u32, crossover2_key: u32,
@@ -3219,8 +3231,8 @@ pub(crate) fn resolve_sample(uuid: boxgraph::address::Uuid) -> Option<abi::Sampl
 /// Resolve a sample handle (Route F) for a device DURING render: write a `SampleRef` to `out_ptr` and return
 /// 1 if the sample is resident (ready), else 0. Bound into each device's `env` like the other `host_*`
 /// imports; reads the `SAMPLES` cell read-only, so it never aliases the `&mut Engine` the render path holds.
-#[no_mangle]
-pub extern "C" fn host_resolve_sample(handle: u32, out_ptr: u32) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn host_resolve_sample(handle: u32, out_ptr: u32) -> u32 {
     match unsafe { SAMPLES.get() }.resolve(handle) {
         Some(sample_ref) => {
             unsafe { *(out_ptr as *mut abi::SampleRef) = sample_ref; }
@@ -3233,8 +3245,8 @@ pub extern "C" fn host_resolve_sample(handle: u32, out_ptr: u32) -> u32 {
 /// Pop the next sample awaiting a load (the engine queued it on seeing an `AudioFileBox`): write its 16-byte
 /// uuid to `out_ptr` and return its handle, or return -1 when none are pending. The worklet drains these
 /// after applying a transaction and dispatches each to the main-thread loader. Off-render.
-#[no_mangle]
-pub extern "C" fn sample_take_request(out_ptr: u32) -> i32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn sample_take_request(out_ptr: u32) -> i32 {
     match unsafe { SAMPLES.get() }.take_pending() {
         Some((handle, uuid)) => {
             unsafe { core::ptr::copy_nonoverlapping(uuid.as_ptr(), out_ptr as *mut u8, 16); }
@@ -3246,23 +3258,23 @@ pub extern "C" fn sample_take_request(out_ptr: u32) -> i32 {
 
 /// Reserve `byte_len` zeroed bytes for the sample's planar f32 frames and return the pointer the loader
 /// writes into. Off-render (the worklet calls it once the loader reports the decoded size).
-#[no_mangle]
-pub extern "C" fn sample_allocate(handle: u32, byte_len: u32) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn sample_allocate(handle: u32, byte_len: u32) -> u32 {
     unsafe { SAMPLES.get() }.allocate(handle, byte_len as usize)
 }
 
 /// Mark a sample ready once the loader has written its frames: `channel_count` planes of `frame_count` f32
 /// each, at `sample_rate`. After this the sample resolves for devices. Off-render.
-#[no_mangle]
-pub extern "C" fn sample_set_ready(handle: u32, frame_count: u32, channel_count: u32, sample_rate: f32) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn sample_set_ready(handle: u32, frame_count: u32, channel_count: u32, sample_rate: f32) {
     unsafe { SAMPLES.get() }.set_ready(handle, frame_count, channel_count, sample_rate);
 }
 
 /// Resolve a soundfont handle for a device DURING render: write a `SoundfontRef` (ptr + len) to `out_ptr` and
 /// return 1 if the blob is resident (ready), else 0. Bound into each device's `env`; reads the `SOUNDFONTS`
 /// cell read-only, so it never aliases the `&mut Engine` the render path holds. Mirrors `host_resolve_sample`.
-#[no_mangle]
-pub extern "C" fn host_resolve_soundfont(handle: u32, out_ptr: u32) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn host_resolve_soundfont(handle: u32, out_ptr: u32) -> u32 {
     match unsafe { SOUNDFONTS.get() }.resolve(handle) {
         Some(soundfont_ref) => {
             unsafe { *(out_ptr as *mut abi::SoundfontRef) = soundfont_ref; }
@@ -3275,8 +3287,8 @@ pub extern "C" fn host_resolve_soundfont(handle: u32, out_ptr: u32) -> u32 {
 /// Pop the next soundfont awaiting a load (queued on seeing a `SoundfontFileBox` target): write its 16-byte
 /// uuid to `out_ptr` and return its handle, or -1 when none pending. The worklet drains these after applying a
 /// transaction and dispatches each to the main-thread soundfont loader. Off-render.
-#[no_mangle]
-pub extern "C" fn soundfont_take_request(out_ptr: u32) -> i32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn soundfont_take_request(out_ptr: u32) -> i32 {
     match unsafe { SOUNDFONTS.get() }.take_pending() {
         Some((handle, uuid)) => {
             unsafe { core::ptr::copy_nonoverlapping(uuid.as_ptr(), out_ptr as *mut u8, 16); }
@@ -3288,15 +3300,15 @@ pub extern "C" fn soundfont_take_request(out_ptr: u32) -> i32 {
 
 /// Reserve `byte_len` zeroed bytes for the soundfont blob and return the pointer the loader writes into.
 /// Off-render (the worklet calls it once the loader reports the built blob size).
-#[no_mangle]
-pub extern "C" fn soundfont_allocate(handle: u32, byte_len: u32) -> u32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn soundfont_allocate(handle: u32, byte_len: u32) -> u32 {
     unsafe { SOUNDFONTS.get() }.allocate(handle, byte_len as usize)
 }
 
 /// Mark a soundfont ready once the loader has written its blob. After this the soundfont resolves for the
 /// device. Off-render.
-#[no_mangle]
-pub extern "C" fn soundfont_set_ready(handle: u32) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn soundfont_set_ready(handle: u32) {
     unsafe { SOUNDFONTS.get() }.set_ready(handle);
 }
 
@@ -3331,14 +3343,14 @@ mod heap {
     static TALC: EngineAlloc = EngineAlloc(TalcCell::new(WasmGrowAndClaim));
 
     /// Bytes currently allocated (live).
-    #[no_mangle]
-    pub extern "C" fn heap_used() -> usize {
+    #[cfg_attr(not(feature = "native"), no_mangle)]
+    pub(crate) extern "C" fn heap_used() -> usize {
         TALC.0.counters().allocated_bytes
     }
 
     /// Total bytes the heap manages (live + free) — the claimed footprint.
-    #[no_mangle]
-    pub extern "C" fn heap_claimed() -> usize {
+    #[cfg_attr(not(feature = "native"), no_mangle)]
+    pub(crate) extern "C" fn heap_claimed() -> usize {
         let counters = TALC.0.counters();
         counters.allocated_bytes + counters.available_bytes
     }
@@ -3368,20 +3380,20 @@ impl core::fmt::Write for BufferWriter {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn panic_message_ptr() -> *const u8 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn panic_message_ptr() -> *const u8 {
     unsafe { PANIC_MESSAGE.get() }.0.as_ptr()
 }
 
-#[no_mangle]
-pub extern "C" fn panic_message_len() -> usize {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn panic_message_len() -> usize {
     unsafe { PANIC_MESSAGE.get() }.1
 }
 
 /// Host import a DEVICE's panic handler calls to deposit ITS panic message before trapping (the abi crate's
 /// shared handler): copied into the same buffer the worklet reads. Writes nothing else, safe at any time.
-#[no_mangle]
-pub extern "C" fn host_panic(msg_ptr: u32, msg_len: u32) {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn host_panic(msg_ptr: u32, msg_len: u32) {
     let (buffer, written) = unsafe { PANIC_MESSAGE.get() };
     let count = (msg_len as usize).min(PANIC_MESSAGE_CAPACITY);
     unsafe { core::ptr::copy_nonoverlapping(msg_ptr as *const u8, buffer.as_mut_ptr(), count); }
@@ -3408,24 +3420,24 @@ pub(crate) fn first_non_finite(left: &[f32], right: &[f32]) -> Option<(usize, us
     frame(left).map(|index| (0, index)).or_else(|| frame(right).map(|index| (1, index)))
 }
 
-#[no_mangle]
-pub extern "C" fn report_message_ptr() -> *const u8 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn report_message_ptr() -> *const u8 {
     unsafe { REPORT_MESSAGE.get() }.0.as_ptr()
 }
 
-#[no_mangle]
-pub extern "C" fn report_message_len() -> usize {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn report_message_len() -> usize {
     unsafe { REPORT_MESSAGE.get() }.1
 }
 
-#[no_mangle]
-pub extern "C" fn report_message_clear() {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn report_message_clear() {
     unsafe { REPORT_MESSAGE.get() }.1 = 0;
 }
 
 /// Parity probe: the REAL value stored for a UNIT automation value, the modulator's `map_parameter`.
-#[no_mangle]
-pub extern "C" fn map_modulator_parameter(kind: u32, key: u32, unit: f32) -> f32 {
+#[cfg_attr(not(feature = "native"), no_mangle)]
+pub(crate) extern "C" fn map_modulator_parameter(kind: u32, key: u32, unit: f32) -> f32 {
     let name = match kind {
         1 => "StepsModulatorBox",
         2 => "MacroModulatorBox",
@@ -3442,7 +3454,7 @@ pub extern "C" fn map_modulator_parameter(kind: u32, key: u32, unit: f32) -> f32
         })
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), target_family = "wasm"))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     use core::fmt::Write;
@@ -3528,4 +3540,15 @@ mod non_finite_report_tests {
         assert_eq!(message(), "third");
         report_message_clear();
     }
+}
+
+#[cfg(feature = "native")]
+pub mod native;
+
+/// WASM address adapter. Native typed devices do not use descriptor addresses.
+fn device_address<T>(pointer: *const T) -> u32 {
+    #[cfg(not(feature = "native"))]
+    { pointer as u32 }
+    #[cfg(feature = "native")]
+    { let _ = pointer; 0 }
 }

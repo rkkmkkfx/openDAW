@@ -43,6 +43,10 @@ pub(crate) fn bind_paths(reg: DeviceReg, state_ptr: u32, sample_rate: f32) -> Ve
     unsafe { SOUNDFONT_OBS.get() }.clear();
     unsafe { FIELD_OBS.get() }.clear();
     unsafe { SIDECHAIN_BIND.get() }.clear();
+    #[cfg(feature = "native")]
+    if reg.process_index == u32::MAX {
+        return device_vaporisateur::parameter_paths().iter().map(|(_,path)| path.to_vec()).collect();
+    }
     call_device_init(reg.init_index, state_ptr, sample_rate);
     core::mem::take(unsafe { BIND.get() })
 }
