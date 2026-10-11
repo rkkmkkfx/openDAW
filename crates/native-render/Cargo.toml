@@ -1,0 +1,9 @@
+[package]
+name = "native-render"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+dsp = {path = "../dsp"}
+engine-env = {path = "../engine-env"}
