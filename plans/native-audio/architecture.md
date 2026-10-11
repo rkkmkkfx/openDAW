@@ -164,7 +164,7 @@ approach's full application behavior.
 6. Validate Windows/macOS native editors/drivers on their platforms; Linux offline
    rendering does not demonstrate desktop audio latency or editor support.
 
-## AI-assisted contribution process
+## Phase 1 AI-assisted contribution process
 
 The user supplied purpose, phased scope, feature branch and PR authorization.
 Read repository `AGENTS.md`, `CLAUDE.md`, README contribution guidance and current
@@ -174,3 +174,28 @@ and requested a separate code review. No graph/DSP rewrite, production ABI chang
 or plugin hosting is included. Tool installation/logs live outside the repository.
 Validation records failures and unavailable checks without treating compile-only
 or Node tests as browser/hardware evidence.
+
+## Subsequent Linux implementation
+
+After Phase 1, the user authorized implementation beyond the initial PoC and
+selected Linux x86_64, CLAP then VST3. A feature-gated native facade now drives
+the existing graph, note/value sequencing, transport and bus/channel processing.
+Its typed production Vaporisateur state replaces the WASM device call boundary;
+the browser's PIC loader and 32-bit descriptor ABI remain intact.
+
+The native facade leases thread-local host context, validates binary framing,
+schema/domain values and typed pointer relationships before publishing snapshots
+or updates, and rejects unsupported project features. Independent fixtures use
+the TypeScript project/transaction serializers and actual WASM device linker.
+Native and WASM output matched exactly in the measured baseline and live gain
+edit fixtures; this establishes subset parity, not parity for arbitrary projects.
+
+The `native-host` CLI runs native graph and optional master-output plugin DSP in
+one process. Its CLAP and VST3 adapters use maintained bindings/hosting libraries,
+real dynamically loaded test plugins, continuous processing, sample-offset events
+and opaque state. Scanning alone is process-isolated. Neither offline adapter is
+claimed to be realtime safe. VST3's maintained host contains processing locks;
+stock device coverage, saved plugin graph insertion, hardware playback, PDC,
+transport integration, native editors and desktop integration remain next stages.
+See [Linux implementation](native-host-implementation.md) and
+[run instructions](../../crates/native-host/README.md).

@@ -1,7 +1,30 @@
 # Native plugin hosting implementation plan
 
-Status: design only; no hosting is implemented in Phase 1.
+Status: Phase 1 was design only. The Linux continuation now includes tested
+offline CLAP and VST3 hosting; realtime and desktop stages remain planned.
 Spec: [architecture](architecture.md). CLAP first, VST3 second.
+
+## Linux continuation status
+
+The continuation provides a typed native facade for the existing graph and
+production Vaporisateur, real CLAP and VST3 offline adapters, WAV/project
+rendering, opaque state, sample-offset MIDI/automation and isolated discovery.
+See [execution ledger](native-host-implementation.md) and
+[runnable commands](../../crates/native-host/README.md). The CLI's optional plugin
+is a master-output stage in the graph's process, not a saved graph device.
+
+The remaining sequence is general graph insertion/state attachments, then a
+realtime-safe CLAP/control split and Linux audio driver, routing/PDC, editors and
+desktop UI integration. VST3 offline support follows the validated CLAP offline
+milestone; its realtime adapter remains separate because the maintained host
+uses process-path locks. The detailed stages below describe those remaining gaps.
+
+The native engine deliberately owns thread-local host contexts and cannot move
+between threads. A callback backend cannot simply capture it in a `Send` driver
+closure. Use an explicitly owned audio thread for initial driver work, or extract
+all host context into instance-owned state before designing thread transfer.
+Plugin lifecycle/control and editor operations must still meet each API's thread
+rules; adding a hardware callback alone does not establish realtime safety.
 
 ## Architecture and invariants
 
