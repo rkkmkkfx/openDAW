@@ -103,7 +103,7 @@ pub(crate) fn read_value(reader: &mut ByteReader, field_type: &FieldType) -> Res
             Ok(String::from_utf16(&units).map_or(FieldValue::Utf16(units), FieldValue::String))
         }
         FieldType::Bytes => {
-            let length = reader.read_int()? as usize;
+            let length = reader.read_count(1)?;
             Ok(FieldValue::Bytes(reader.read_raw(length)?))
         }
         FieldType::Pointer => {
@@ -139,11 +139,12 @@ pub fn read_fields(reader: &mut ByteReader, schema: &Schema) -> Result<Fields, E
     if reader.read_int()? != MAGIC {
         return Err(Error::BadMagic);
     }
-    let count = reader.read_short()? as usize;
+    let count = usize::try_from(reader.read_short()?).map_err(|_| Error::UnexpectedEnd)?;
+    if count > reader.remaining() / 6 { return Err(Error::UnexpectedEnd); }
     let mut fields = Fields::new();
     for _ in 0..count {
         let key = reader.read_short()? as u16;
-        let length = reader.read_int()? as usize;
+        let length = reader.read_count(1)?;
         let payload = reader.read_raw(length)?;
         if let Some(field_type) = schema.get(&key) {
             let mut sub = ByteReader::new(&payload);

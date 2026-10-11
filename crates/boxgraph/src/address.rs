@@ -116,7 +116,8 @@ impl Address {
 
     pub fn read(reader: &mut ByteReader) -> Result<Self, ByteError> {
         let uuid = read_uuid(reader)?;
-        let count = reader.read_byte()? as usize;
+        let count = usize::try_from(reader.read_byte()?).map_err(|_| ByteError::UnexpectedEnd)?;
+        if count > reader.remaining() / 2 { return Err(ByteError::UnexpectedEnd); }
         let mut field_keys = Vec::with_capacity(count);
         for _ in 0..count {
             field_keys.push(reader.read_short()? as u16)

@@ -58,7 +58,7 @@ fn write_optional_address(writer: &mut ByteWriter, address: &Option<Address>) {
 }
 
 pub fn decode(reader: &mut ByteReader) -> Result<Vec<Update>, Error> {
-    let count = reader.read_int()? as usize;
+    let count = reader.read_count(4)?;
     let mut updates = Vec::with_capacity(count);
     for _ in 0..count {
         let update_type = reader.read_string()?;
@@ -130,7 +130,7 @@ pub fn encode(writer: &mut ByteWriter, updates: &[Update]) {
 }
 
 fn read_settings(reader: &mut ByteReader) -> Result<Vec<u8>, Error> {
-    let length = reader.read_int()? as usize;
+    let length = reader.read_count(1)?;
     Ok(reader.read_raw(length)?)
 }
 
@@ -140,7 +140,7 @@ fn read_settings(reader: &mut ByteReader) -> Result<Vec<u8>, Error> {
 /// Type tags differ from the `.odsl` stream: `new` / `update-primitive` / `update-pointer` /
 /// `delete` (uuid-only).
 pub fn decode_forward(reader: &mut ByteReader) -> Result<Vec<Update>, Error> {
-    let count = reader.read_int()? as usize;
+    let count = reader.read_count(4)?;
     let mut updates = Vec::with_capacity(count);
     for _ in 0..count {
         let task_type = reader.read_string()?;

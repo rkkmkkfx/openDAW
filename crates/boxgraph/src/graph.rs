@@ -55,10 +55,10 @@ impl BoxGraph {
 
     pub fn from_bytes(bytes: &[u8], registry: &Registry) -> Result<Self, Error> {
         let mut reader = ByteReader::new(bytes);
-        let count = reader.read_int()? as usize;
+        let count = reader.read_count(4)?;
         let mut loaded: Vec<GraphBox> = Vec::with_capacity(count);
         for _ in 0..count {
-            let length = reader.read_int()? as usize;
+            let length = reader.read_count(1)?;
             let box_bytes = reader.read_raw(length)?;
             let mut box_reader = ByteReader::new(&box_bytes);
             loaded.push(GraphBox::read(&mut box_reader, registry)?);
